@@ -91,6 +91,25 @@ from modeling import (
     resolve_local_pretrained_path,
 )
 
+try:
+    from train.depth_controller.controller_helper import FEATURE_NAMES
+    from train.depth_controller.depth_controller import DepthController
+except ImportError:
+    FEATURE_NAMES = [
+        "round_fraction",
+        "planner_to_refiner_norm",
+        "refiner_to_solver_norm",
+        "feedback_to_planner_norm",
+        "planner_norm_delta",
+        "refiner_norm_delta",
+        "feedback_norm_delta",
+        "latent_drift",
+        "feedback_cosine_to_previous",
+        "is_first_round",
+        "is_last_round",
+    ]
+    from depth_controller import DepthController
+
 _CHAT_TEMPLATE_IDS_FALLBACK_WARNED = False
 _GEN_TOP_K: Optional[int] = None
 _GEN_MIN_P: Optional[float] = None
@@ -160,6 +179,107 @@ def resolve_dtype(dtype_str: str):
     if dtype_str == "auto":
         return "auto"
     return None
+
+
+def load_depth_controller(
+    checkpoint_path: str,
+    device: torch.device,
+) -> Tuple[DepthController, torch.Tensor, torch.Tensor]:
+    """Load a trained controller and its training-time feature normalization."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"Depth controller checkpoint is missing model_state_dict: {checkpoint_path}")
+
+    feature_names = checkpoint.get("feature_names", FEATURE_NAMES)
+    if list(feature_names) != list(FEATURE_NAMES):
+        raise ValueError(
+            "Depth controller feature order does not match inference. "
+            f"Expected {FEATURE_NAMES}, got {feature_names}."
+        )
+    hidden_size = int(checkpoint.get("hidden_size", len(FEATURE_NAMES)))
+    if hidden_size != len(FEATURE_NAMES):
+        raise ValueError(f"Expected {len(FEATURE_NAMES)} controller features, got {hidden_size}")
+
+    controller = DepthController(hidden_size=hidden_size, adapter_type="sequential")
+    controller.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    controller.to(device=device, dtype=torch.float32)
+    controller.eval()
+
+    feature_mean = torch.as_tensor(
+        checkpoint.get("feature_mean", torch.zeros(hidden_size)), dtype=torch.float32, device=device
+    )
+    feature_std = torch.as_tensor(
+        checkpoint.get("feature_std", torch.ones(hidden_size)), dtype=torch.float32, device=device
+    ).clamp_min(1e-6)
+    return controller, feature_mean, feature_std
+
+
+def build_depth_controller_features(
+    round_idx: int,
+    max_depth: int,
+    planner_latents: Sequence[torch.Tensor],
+    refiner_latents: Sequence[torch.Tensor],
+    feedback_latents: Sequence[torch.Tensor],
+    previous_planner_latents: Optional[Sequence[torch.Tensor]],
+    previous_refiner_latents: Optional[Sequence[torch.Tensor]],
+    previous_feedback_latents: Optional[Sequence[torch.Tensor]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the 11 features used by the offline-trained sequential controller."""
+    if not (len(planner_latents) == len(refiner_latents) == len(feedback_latents)):
+        raise ValueError("Controller latent batches must have equal length")
+
+    def latent_norm(latent: torch.Tensor) -> float:
+        return float(torch.linalg.vector_norm(latent.float()).item())
+
+    rows: List[List[float]] = []
+    for index, (planner, refiner, feedback) in enumerate(
+        zip(planner_latents, refiner_latents, feedback_latents)
+    ):
+        planner_norm = latent_norm(planner)
+        refiner_norm = latent_norm(refiner)
+        feedback_norm = latent_norm(feedback)
+        previous_planner_norm = (
+            latent_norm(previous_planner_latents[index])
+            if previous_planner_latents is not None
+            else 0.0
+        )
+        previous_refiner_norm = (
+            latent_norm(previous_refiner_latents[index])
+            if previous_refiner_latents is not None
+            else 0.0
+        )
+        previous_feedback_norm = (
+            latent_norm(previous_feedback_latents[index])
+            if previous_feedback_latents is not None
+            else 0.0
+        )
+        if previous_feedback_latents is None:
+            feedback_cosine = 0.0
+        else:
+            feedback_cosine = float(
+                torch.nn.functional.cosine_similarity(
+                    feedback.float().reshape(1, -1),
+                    previous_feedback_latents[index].float().reshape(1, -1),
+                    dim=-1,
+                ).item()
+            )
+        rows.append(
+            [
+                round_idx / max(float(max_depth), 1.0),
+                planner_norm,
+                refiner_norm,
+                feedback_norm,
+                planner_norm - previous_planner_norm,
+                refiner_norm - previous_refiner_norm,
+                feedback_norm - previous_feedback_norm,
+                abs(refiner_norm - planner_norm),
+                feedback_cosine,
+                float(round_idx == 0),
+                float(round_idx == max_depth - 1),
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
 def resolve_dataset(name: str) -> Tuple[str, Optional[str]]:
@@ -1807,6 +1927,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer_23_path", type=str, default=None)
     parser.add_argument("--outer_31_path", type=str, default=None)
     parser.add_argument(
+        "--depth_controller_path",
+        type=str,
+        default=None,
+        help="Optional trained depth-controller checkpoint for adaptive recursive stopping.",
+    )
+    parser.add_argument(
         "--inner_adapter_type_fallback",
         type=str,
         default="ln_res_adapter",
@@ -1993,6 +2119,16 @@ def main() -> None:
     if device.type == "cpu" and outer_dtype in {torch.float16, torch.bfloat16}:
         print("[warn] CPU selected with fp16/bf16 outer adapter. Falling back outer dtype to float32.")
         outer_dtype = torch.float32
+
+    depth_controller = None
+    depth_controller_mean = None
+    depth_controller_std = None
+    if args.depth_controller_path:
+        depth_controller, depth_controller_mean, depth_controller_std = load_depth_controller(
+            args.depth_controller_path,
+            device=device,
+        )
+        print(f"[depth-controller] loaded {args.depth_controller_path}")
 
     trust_remote_code = bool(args.trust_remote_code)
     enable_thinking = bool(args.enable_thinking)
@@ -2506,11 +2642,22 @@ def main() -> None:
         feedback_to_planner_rounds: List[List[torch.Tensor]] = []
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
+        active_indices = list(range(len(questions)))
+        final_refiner_to_solver: List[Optional[torch.Tensor]] = [None] * len(questions)
+        previous_by_index: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
         for round_idx in range(recursive_rounds):
+            active_questions = [questions[index] for index in active_indices]
+            active_task_types = (
+                [task_types[index] for index in active_indices] if task_types is not None else None
+            )
+            active_fn_names = (
+                [fn_names[index] for index in active_indices] if fn_names is not None else None
+            )
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(
                     model_name_or_path=planner_model,
-                    questions=questions,
+                    questions=active_questions,
                     agent1_inner_aligner_path=args.agent1_inner_aligner_path,
                     outer_12_path=outer_12_path,
                     outer_12_type=outer_12_type,
@@ -2522,15 +2669,15 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
-                    task_types=task_types,
-                    fn_names=fn_names,
+                    task_types=active_task_types,
+                    fn_names=active_fn_names,
                 )
             else:
                 if feedback_to_planner is None:
                     raise RuntimeError("Missing recursive feedback latents for planner stage.")
                 planner_to_refiner = run_planner_feedback_latent_stage(
                     model_name_or_path=planner_model,
-                    questions=questions,
+                    questions=active_questions,
                     feedback_latents=feedback_to_planner,
                     agent1_inner_aligner_path=args.agent1_inner_aligner_path,
                     outer_12_path=outer_12_path,
@@ -2543,13 +2690,14 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    task_types=active_task_types,
+                    fn_names=active_fn_names,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
-            planner_to_refiner_rounds.append(planner_to_refiner)
 
             refiner_to_solver = run_refiner_latent_stage(
                 model_name_or_path=refiner_model,
-                questions=questions,
+                questions=active_questions,
                 planner_latents=planner_to_refiner,
                 agent2_inner_aligner_path=args.agent2_inner_aligner_path,
                 outer_23_path=outer_23_path,
@@ -2562,16 +2710,24 @@ def main() -> None:
                 trust_remote_code=trust_remote_code,
                 inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                 enable_thinking=enable_thinking,
-                task_types=task_types,
-                fn_names=fn_names,
+                task_types=active_task_types,
+                fn_names=active_fn_names,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
-            refiner_to_solver_rounds.append(refiner_to_solver)
+
+            full_planner_round = [None] * len(questions)
+            full_refiner_round = [None] * len(questions)
+            for local_index, global_index in enumerate(active_indices):
+                full_planner_round[global_index] = planner_to_refiner[local_index]
+                full_refiner_round[global_index] = refiner_to_solver[local_index]
+                final_refiner_to_solver[global_index] = refiner_to_solver[local_index]
+            planner_to_refiner_rounds.append(full_planner_round)
+            refiner_to_solver_rounds.append(full_refiner_round)
 
             if round_idx < recursive_rounds - 1:
                 feedback_to_planner = run_solver_feedback_latent_stage(
                     model_name_or_path=solver_model,
-                    questions=questions,
+                    questions=active_questions,
                     refiner_latents=refiner_to_solver,
                     agent3_inner_aligner_path=args.agent3_inner_aligner_path,
                     outer_31_path=outer_31_path,
@@ -2585,13 +2741,67 @@ def main() -> None:
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
                     args=args,
-                    task_types=task_types,
-                    fn_names=fn_names,
+                    task_types=active_task_types,
+                    fn_names=active_fn_names,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
-                feedback_to_planner_rounds.append(feedback_to_planner)
+                full_feedback_round = [None] * len(questions)
+                for local_index, global_index in enumerate(active_indices):
+                    full_feedback_round[global_index] = feedback_to_planner[local_index]
+                feedback_to_planner_rounds.append(full_feedback_round)
 
-        final_refiner_to_solver = refiner_to_solver_rounds[-1]
+                if depth_controller is not None:
+                    previous_planner = []
+                    previous_refiner = []
+                    previous_feedback = []
+                    for global_index in active_indices:
+                        previous = previous_by_index.get(global_index)
+                        if previous is None:
+                            previous_planner.append(torch.zeros_like(planner_to_refiner[0]))
+                            previous_refiner.append(torch.zeros_like(refiner_to_solver[0]))
+                            previous_feedback.append(torch.zeros_like(feedback_to_planner[0]))
+                        else:
+                            previous_planner.append(previous[0])
+                            previous_refiner.append(previous[1])
+                            previous_feedback.append(previous[2])
+                    controller_features = build_depth_controller_features(
+                        round_idx=round_idx,
+                        max_depth=recursive_rounds,
+                        planner_latents=planner_to_refiner,
+                        refiner_latents=refiner_to_solver,
+                        feedback_latents=feedback_to_planner,
+                        previous_planner_latents=previous_planner,
+                        previous_refiner_latents=previous_refiner,
+                        previous_feedback_latents=previous_feedback,
+                        device=device,
+                    )
+                    controller_input = (controller_features - depth_controller_mean) / depth_controller_std
+                    with torch.no_grad():
+                        continue_probability = torch.sigmoid(depth_controller(controller_input).squeeze(-1))
+                    should_continue = continue_probability >= 0.5
+                    print(
+                        f"[depth-controller] after round {round_idx + 1}: "
+                        f"continue_probability_mean={continue_probability.mean().item():.3f} "
+                        f"continue_samples={int(should_continue.sum().item())}/{len(should_continue)}"
+                    )
+                    for local_index, global_index in enumerate(active_indices):
+                        previous_by_index[global_index] = (
+                            planner_to_refiner[local_index],
+                            refiner_to_solver[local_index],
+                            feedback_to_planner[local_index],
+                        )
+                    active_indices = [
+                        global_index
+                        for local_index, global_index in enumerate(active_indices)
+                        if bool(should_continue[local_index].item())
+                    ]
+                    if not active_indices:
+                        print(f"[depth-controller] all samples stopped after round {round_idx + 1}")
+                        break
+
+        if any(latent is None for latent in final_refiner_to_solver):
+            raise RuntimeError("Adaptive recursion did not produce final refiner latents for every sample.")
+        final_refiner_to_solver = [latent for latent in final_refiner_to_solver if latent is not None]
         solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
             questions=questions,
@@ -2610,22 +2820,40 @@ def main() -> None:
             fn_names=fn_names,
         )
 
+        def fill_round_history(rounds: List[List[Optional[torch.Tensor]]]) -> List[List[torch.Tensor]]:
+            filled: List[List[torch.Tensor]] = []
+            previous: List[Optional[torch.Tensor]] = [None] * len(questions)
+            for round_latents in rounds:
+                current: List[torch.Tensor] = []
+                for index, latent in enumerate(round_latents):
+                    if latent is not None:
+                        previous[index] = latent
+                    if previous[index] is None:
+                        raise RuntimeError("Missing latent history for adaptive recursion logging.")
+                    current.append(previous[index])
+                filled.append(current)
+            return filled
+
         planner_to_refiner_desc_rounds = [
-            [format_latent_info(x) for x in round_latents] for round_latents in planner_to_refiner_rounds
+            [format_latent_info(x) for x in round_latents]
+            for round_latents in fill_round_history(planner_to_refiner_rounds)
         ]
         refiner_to_solver_desc_rounds = [
-            [format_latent_info(x) for x in round_latents] for round_latents in refiner_to_solver_rounds
+            [format_latent_info(x) for x in round_latents]
+            for round_latents in fill_round_history(refiner_to_solver_rounds)
         ]
         feedback_to_planner_desc_rounds = [
-            [format_latent_info(x) for x in round_latents] for round_latents in feedback_to_planner_rounds
+            [format_latent_info(x) for x in round_latents]
+            for round_latents in fill_round_history(feedback_to_planner_rounds)
         ]
+        executed_rounds = len(planner_to_refiner_desc_rounds)
         solver_rollout_latents = [x for x in final_refiner_to_solver]
 
         agent1_outputs = []
         for i in range(len(questions)):
             parts = [
                 f"r{rid + 1}_to_agent2={planner_to_refiner_desc_rounds[rid][i]}"
-                for rid in range(recursive_rounds)
+                for rid in range(executed_rounds)
             ]
             agent1_outputs.append("; ".join(parts))
 
@@ -2649,7 +2877,7 @@ def main() -> None:
         for i in range(len(questions)):
             parts = [
                 f"r{rid + 1}_to_agent3={refiner_to_solver_desc_rounds[rid][i]}"
-                for rid in range(recursive_rounds)
+                for rid in range(executed_rounds)
             ]
             agent2_outputs.append("; ".join(parts))
 
@@ -2699,7 +2927,7 @@ def main() -> None:
         agent1_inputs_for_log = []
         for i in range(len(questions)):
             parts = [f"[Round1 planner input]\n{a1_round1_rendered[i]}"]
-            for rid in range(1, recursive_rounds):
+            for rid in range(1, executed_rounds):
                 fb_desc = feedback_to_planner_desc_rounds[rid - 1][i]
                 parts.append(f"[Round{rid} feedback latent] {fb_desc}")
                 parts.append(f"[Round{rid + 1} planner input]\n{a1_roundk_rendered[i]}")

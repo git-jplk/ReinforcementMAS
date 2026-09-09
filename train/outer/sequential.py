@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 from torch.utils.data import DataLoader
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+from depth_controller.controller_data import collect_from_sequential_trace, collect_from_trace, save_controller_dataset
 
 from mas_prompt import (
     FEEDBACK_SLOT,
@@ -123,6 +124,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--save_steps", type=int, default=0)
+    parser.add_argument(
+        "--controller_data_path",
+        type=str,
+        default=None,
+        help="JSONL path for saving controller dataset.",
+    )
     return parser.parse_args(argv)
 
 
@@ -233,6 +240,8 @@ def main(argv=None) -> None:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model_dtype = resolve_dtype(args.dtype)
     outer_dtype = resolve_dtype(args.outer_dtype)
+    controller_data_path = args.controller_data_path
+    collect_data = bool(controller_data_path is not None and len(controller_data_path.strip()) > 0)
     if model_dtype is None or outer_dtype is None:
         raise ValueError("Unsupported dtype configuration.")
 
@@ -363,6 +372,11 @@ def main(argv=None) -> None:
         scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps)
 
     os.makedirs(args.save_dir, exist_ok=True)
+    
+    if(collect_data):
+        controller_buffer = []
+   
+    
 
     global_step = 0
     start_time = time.time()
@@ -385,7 +399,7 @@ def main(argv=None) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            for sample in batch:
+            for sample_index, sample in enumerate(batch):
                 q = str(sample["question"]).strip()
                 p = str(sample["plan"]).strip()
                 rp = str(sample["refined_plan"]).strip()
@@ -399,6 +413,11 @@ def main(argv=None) -> None:
                 try:
                     feedback_to_planner = None
                     round_losses: List[torch.Tensor] = []
+                    if collect_data:
+                        controller_history = []
+                        prev_loss = None
+                        prev_conf = None
+                        previous_feedback_to_planner = None
 
                     for round_idx in range(args.num_recursive_rounds):
                         # Planner
@@ -486,6 +505,11 @@ def main(argv=None) -> None:
                         )
                         planner_to_refiner = trim_latent(planner_to_refiner, args.max_latent_tokens)
 
+                        if collect_data:
+                            try:
+                                planner_to_refiner_norm = float(planner_to_refiner.norm().item()) if planner_to_refiner is not None else 0.0
+                            except Exception:
+                                planner_to_refiner_norm = None
                         # Refiner
                         if args.mas_task == "code":
                             refiner_user_with_slot = build_code_refiner_prompt_with_slot(
@@ -534,6 +558,26 @@ def main(argv=None) -> None:
                         )
                         refiner_to_solver = trim_latent(refiner_to_solver, args.max_latent_tokens)
 
+                        # collect data for controller warm start
+                        # record refiner->solver latent norm for controller diagnostics
+                        if collect_data:
+                            try:
+                                refiner_to_solver_norm = float(refiner_to_solver.norm().item()) if refiner_to_solver is not None else 0.0
+                            except Exception:
+                                refiner_to_solver_norm = None
+
+                            controller_row = {
+                                "sample_id": f"{q}::{global_step}::{sample_index}",
+                                "round_idx": round_idx,
+                                "max_depth": args.num_recursive_rounds,
+                                "planner_to_refiner_norm": planner_to_refiner_norm,
+                                "refiner_to_solver_norm": refiner_to_solver_norm,
+                                "feedback_to_planner_norm": 0.0,
+                                "feedback_cosine_to_previous": 0.0,
+                                "last_round": round_idx == args.num_recursive_rounds - 1,
+                            }
+                            controller_history.append(controller_row)
+                        
                         # Solver
                         if args.mas_task == "code":
                             solver_user_with_slot = build_code_solver_prompt_with_slots(
@@ -584,6 +628,9 @@ def main(argv=None) -> None:
                             round_losses = []
                             break
                         round_losses.append(loss_round)
+                        if collect_data:
+                            if controller_history:
+                                controller_history[-1]["loss"] = float(loss_round.detach().item())
 
                         # Feedback for next round (solver -> planner)
                         if need_feedback:
@@ -596,10 +643,35 @@ def main(argv=None) -> None:
                                 outer_31, solver_inner, out_dtype=planner_embed.weight.dtype
                             )
                             feedback_to_planner = trim_latent(feedback_to_planner, args.max_latent_tokens)
+                            if collect_data and controller_history:
+                                try:
+                                    feedback_norm = float(feedback_to_planner.norm().item())
+                                    if previous_feedback_to_planner is None:
+                                        feedback_cosine = 0.0
+                                    else:
+                                        feedback_cosine = float(
+                                            torch.nn.functional.cosine_similarity(
+                                                feedback_to_planner.float().reshape(1, -1),
+                                                previous_feedback_to_planner.float().reshape(1, -1),
+                                                dim=-1,
+                                            ).item()
+                                        )
+                                except Exception:
+                                    feedback_norm = 0.0
+                                    feedback_cosine = 0.0
+                                controller_history[-1]["feedback_to_planner_norm"] = feedback_norm
+                                controller_history[-1]["feedback_cosine_to_previous"] = feedback_cosine
+                                previous_feedback_to_planner = feedback_to_planner.detach()
+                            
+                    if collect_data:
+                        controller_buffer.extend(collect_from_sequential_trace(controller_history))
 
                     if not round_losses:
                         skipped_count += 1
                         continue
+                    
+          
+
 
                     if args.supervise_final_only:
                         loss = round_losses[-1]
@@ -665,7 +737,9 @@ def main(argv=None) -> None:
 
         if global_step >= max_train_steps:
             break
-
+        
+    if collect_data:
+        save_controller_dataset(controller_buffer, args.controller_data_path)
     save_recursive_outer_checkpoint(args.save_dir, None, outer_12, outer_23, outer_31, args)
     elapsed = time.time() - start_time
 

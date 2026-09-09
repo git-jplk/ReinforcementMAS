@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
              "mixture {math,code,science,summarizer,outer}; distillation {expert,learner,outer}; "
              "deliberation {reflector,toolcaller,outer}.",
     )
+    p.add_argument("--depth_controller_path", default="", help="Path to a trained DepthController checkpoint (optional).")
     return p
 
 
@@ -328,6 +329,7 @@ def build_cli_for_style(
             "--solver_pre_question", "0",
             "--inner_adapter_type_fallback", "ln_res_adapter",
             "--outer_adapter_type_fallback", "outer_ln_res_adapter",
+            "--depth_controller_path", str(args.depth_controller_path) if args.depth_controller_path else "",
         ] + common
         return inference_mas, cli
 
