@@ -1,0 +1,45 @@
+diff --git a/inference/inference_utils/inference_mas.py b/inference/inference_utils/inference_mas.py
+index 94aad95..461d5ec 100644
+--- a/inference/inference_utils/inference_mas.py
++++ b/inference/inference_utils/inference_mas.py
+@@ -1932,13 +1932,17 @@ def parse_args() -> argparse.Namespace:
+     )
+ 
+     parser.add_argument("--solver_pre_question", type=int, default=0)
++    parser.add_argument("--method", type=str, default="ours_recursive",
++                        choices=["text", "text_recursive", "ours", "ours_recursive"],
++                        help="Collaboration method. Re-exposed by thesis patch 001.")
+ 
+     return parser.parse_args()
+ 
+ 
+ def main() -> None:
+     args = parse_args()
+-    args.method = "ours_recursive"
++    # thesis patch 001: method now comes from --method
++
+     global _GEN_TOP_K, _GEN_MIN_P, _GEN_REPETITION_PENALTY
+ 
+     if args.mas_shape != "chain":
+diff --git a/inference/run.py b/inference/run.py
+index 9848632..d2d80f9 100755
+--- a/inference/run.py
++++ b/inference/run.py
+@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
+     p.add_argument("--batch_size", type=int, default=8)
+     p.add_argument("--latent_length", type=int, default=32)
+     p.add_argument("--temperature", type=float, default=0.6)
++    p.add_argument("--method", type=str, default="ours_recursive",
++                   choices=["text", "text_recursive", "ours", "ours_recursive"],
++                   help="Collaboration method. Re-exposed by thesis patch 001.")
+     p.add_argument("--top_p", type=float, default=0.95)
+     p.add_argument("--top_k", type=int, default=-1)
+     p.add_argument("--num_rollouts", type=int, default=1, help="Stochastic rollouts for pass@k. AIME defaults to 10 (pass@10) if not set.")
+@@ -265,6 +268,7 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split:
+         out.extend(["--lcb_use_private_tests", str(args.lcb_use_private_tests), "--lcb_timeout_s", "6"])
+     if args.device is not None:
+         out.extend(["--device", str(args.device)])
++    out.extend(["--method", str(args.method)])
+     out.append("--do_sample")
+     out.append("--ans")
+     return out

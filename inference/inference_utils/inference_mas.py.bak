@@ -101,14 +101,6 @@ _GEN_REPETITION_PENALTY: float = 1.0
 # num_recursive_rounds; temperature is included only where it is dataset-specific (lcb).
 # AIME pass@10 (num_rollouts=10) is handled in run.py. Explicit CLI flags always override
 # these, leaving other datasets unaffected.
-# --- PROBE-PATCH (Anfang): nicht-invasives Auslesen der Latents -------------
-try:
-    from inference_utils import probe_readout as _probe
-except Exception:  # Direktstart ohne Paketkontext
-    import probe_readout as _probe
-# --- PROBE-PATCH (Ende) ----------------------------------------------------
-
-
 RELEASE_RECOMMENDED_SETTINGS: Dict[Tuple[str, str], Dict[str, float]] = {
     # sequential_light
     ("sequential_light", "math500"): {"seed": 42, "batch_size": 16, "latent_length": 32, "num_recursive_rounds": 3},
@@ -152,20 +144,6 @@ RELEASE_RECOMMENDED_SETTINGS: Dict[Tuple[str, str], Dict[str, float]] = {
     ("mixture", "aime26"): {"seed": 42, "batch_size": 15, "latent_length": 32, "num_recursive_rounds": 2},
     ("mixture", "lcb"): {"seed": 42, "batch_size": 12, "latent_length": 16, "num_recursive_rounds": 2, "temperature": 0.2},
 }
-
-def latent_norm_stats(t: torch.Tensor) -> Dict[str, float]:
-    """Norm-Statistik einer Latent-Nachricht (m, d)."""
-    if t is None or t.numel() == 0:
-        return {}
-    x = t.detach().float()
-    n = x.norm(dim=-1)
-    return {
-        "mean": float(n.mean()),
-        "std": float(n.std()) if n.numel() > 1 else 0.0,
-        "min": float(n.min()),
-        "max": float(n.max()),
-        "fro": float(x.norm()),
-    }
 
 
 def get_release_recommended_settings(style: str, dataset: str) -> Optional[Dict[str, float]]:
@@ -1175,12 +1153,6 @@ def run_planner_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="planner->critic", sender="planner", receiver="critic", start=start,
-            hidden=hidden_rollout, inner=planner_self, outer=lat12,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=input_embeds, attention_mask=attention_mask,
-        )
 
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1302,12 +1274,6 @@ def run_refiner_latent_stage(
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="critic->solver", sender="critic", receiver="solver", start=start,
-            hidden=hidden_rollout, inner=refiner_self, outer=mapped,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
 
@@ -1431,12 +1397,6 @@ def run_solver_feedback_latent_stage(
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="solver->planner", sender="solver", receiver="planner", start=start,
-            hidden=hidden_rollout, inner=solver_self, outer=mapped_feedback,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
 
@@ -1557,12 +1517,6 @@ def run_planner_feedback_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="planner->critic", sender="planner", receiver="critic", start=start,
-            hidden=hidden_rollout, inner=planner_self, outer=lat12,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
@@ -1586,7 +1540,7 @@ def run_solver_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
-) -> Tuple[List[str], List[Dict[str, Any]]]:
+) -> List[str]:
     model, tokenizer = load_agent_model_and_tokenizer(
         model_name_or_path=model_name_or_path,
         device=device,
@@ -1635,7 +1589,6 @@ def run_solver_latent_stage(
     )
 
     outputs: List[str] = []
-    gen_stats: List[Dict[str, Any]] = []
     total_batches = (len(questions) + batch_size - 1) // batch_size
     for start, end in tqdm(
         batch_iter_indices(len(questions), batch_size),
@@ -1688,24 +1641,8 @@ def run_solver_latent_stage(
         batch_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         outputs.extend([text.strip() for text in batch_texts])
 
-        # NEU: Tokenbudget pro Sample
-        eos_id = tokenizer.eos_token_id
-        pad_id = gen_kwargs.get("pad_token_id")
-        for row in gen_ids:
-            ids_list = row.tolist()
-            if eos_id is not None and eos_id in ids_list:
-                n = ids_list.index(eos_id)
-                hit = False
-            else:
-                n = len(ids_list)
-                while n > 0 and ids_list[n - 1] == pad_id:
-                    n -= 1
-                hit = n >= int(max_new_tokens)
-            gen_stats.append({"n_gen_tokens": int(n), "hit_max_tokens": bool(hit)})
-
     release_resources(model, tokenizer)
-    return outputs, gen_stats
-
+    return outputs
 
 
 def run_answer_retry_stage(
@@ -1720,7 +1657,7 @@ def run_answer_retry_stage(
     temperature: float,
     top_p: float,
     max_new_tokens: int = 16,
-) -> Tuple[List[str], List[int]]:
+) -> Tuple[List[str], int]:
     is_code_eval = is_code_eval_dataset(dataset_name)
     if is_code_eval:
         pending_indices = [
@@ -1738,7 +1675,7 @@ def run_answer_retry_stage(
         retry_suffix = "Final Answer: \\boxed{"
 
     if not pending_indices:
-        return list(outputs), []
+        return list(outputs), 0
 
     retry_max_new_tokens = int(max_new_tokens)
     if is_code_eval and retry_max_new_tokens < 256:
@@ -1793,7 +1730,7 @@ def run_answer_retry_stage(
             updated_outputs[global_i] = batch_prompts[local_i] + suffix
 
     release_resources(model, tokenizer)
-    return updated_outputs, list(pending_indices)
+    return updated_outputs, len(pending_indices)
 
 
 def render_inputs_for_logging(
@@ -1994,39 +1931,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save per-sample results as JSONL.",
     )
 
-    # --- PROBE-PATCH (Anfang): Analyse-Auslesen, standardmaessig aus ---------
-    parser.add_argument(
-        "--probe_readout",
-        action="store_true",
-        help="Latents zusaetzlich als Text ins Probe-Log schreiben. Aendert den Lauf nicht.",
-    )
-    parser.add_argument("--probe_jsonl", type=str, default="",
-                        help="Zieldatei des Probe-Logs. Ohne Pfad bleibt der Probe aus.")
-    parser.add_argument("--probe_indices", type=str, default="",
-                        help="Kommaliste von Fragenindizes, z. B. '3,17,88'.")
-    parser.add_argument("--probe_ids_file", type=str, default="",
-                        help="Datei mit je einem Index oder Fragen-Hash pro Zeile.")
-    parser.add_argument("--probe_max_questions", type=int, default=20,
-                        help="Obergrenze der ausgelesenen Fragen (Schutz vor Riesenlogs).")
-    parser.add_argument("--probe_positions", type=str, default="last8",
-                        help="Welche Latent-Positionen: all | lastK | firstK | everyK | 0,-1")
-    parser.add_argument("--probe_topk", type=int, default=5,
-                        help="Wie viele Tokens je Position protokolliert werden.")
-    parser.add_argument("--probe_read_tokens", type=int, default=64,
-                        help="Laenge der Lese-Generierung je Stufe. 0 schaltet sie ab.")
-    # --- PROBE-PATCH (Ende) -------------------------------------------------
     parser.add_argument("--solver_pre_question", type=int, default=0)
-    parser.add_argument("--method", type=str, default="ours_recursive",
-                        choices=["text", "text_recursive", "ours", "ours_recursive"],
-                        help="Collaboration method. Re-exposed by thesis patch 001.")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    # thesis patch 001: method now comes from --method
-
+    args.method = "ours_recursive"
     global _GEN_TOP_K, _GEN_MIN_P, _GEN_REPETITION_PENALTY
 
     if args.mas_shape != "chain":
@@ -2128,19 +2040,6 @@ def main() -> None:
             print("[warn] --num_rollouts > 1 but --do_sample is disabled; outputs may be identical.")
 
     base_sample_seed = args.sample_seed if args.sample_seed >= 0 else args.seed
-
-    # --- PROBE-PATCH (Anfang) -----------------------------------------------
-    if getattr(args, "probe_readout", False):
-        _probe.configure(
-            args=args,
-            questions=questions,
-            role_paths={
-                "planner": planner_model,
-                "critic": refiner_model,
-                "solver": solver_model,
-            },
-        )
-    # --- PROBE-PATCH (Ende) -------------------------------------------------
 
     planner_questions = list(questions)
     is_text_method = args.method in {"text", "text_recursive"}
@@ -2303,7 +2202,7 @@ def main() -> None:
 
     solver_rollout_latents: Optional[List[torch.Tensor]] = None
     text_recursive_solver_outputs_rounds_for_log: Optional[List[List[str]]] = None
-    latent_norms_per_sample: List[Any] = []
+
     if args.method == "text":
         planner_outputs, planner_inputs_rendered = run_text_generation_stage(
             stage_name="planner",
@@ -2537,7 +2436,7 @@ def main() -> None:
             task_types=task_types,
             fn_names=fn_names,
         )
-        solver_outputs, solver_gen_stats = run_solver_latent_stage(
+        solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
             questions=questions,
             refiner_latents=refiner_to_solver,
@@ -2608,7 +2507,6 @@ def main() -> None:
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
         for round_idx in range(recursive_rounds):
-            _probe.set_round(round_idx)  # PROBE-PATCH
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(
                     model_name_or_path=planner_model,
@@ -2694,7 +2592,7 @@ def main() -> None:
                 feedback_to_planner_rounds.append(feedback_to_planner)
 
         final_refiner_to_solver = refiner_to_solver_rounds[-1]
-        solver_outputs, solver_gen_stats = run_solver_latent_stage(
+        solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
             questions=questions,
             refiner_latents=final_refiner_to_solver,
@@ -2722,19 +2620,7 @@ def main() -> None:
             [format_latent_info(x) for x in round_latents] for round_latents in feedback_to_planner_rounds
         ]
         solver_rollout_latents = [x for x in final_refiner_to_solver]
-        latent_norms_per_sample: List[Dict[str, Any]] = []
-        for i in range(len(questions)):
-            per_round = []
-            for rid in range(recursive_rounds):
-                entry = {
-                    "round": rid + 1,
-                    "p2r": latent_norm_stats(planner_to_refiner_rounds[rid][i]),
-                    "r2s": latent_norm_stats(refiner_to_solver_rounds[rid][i]),
-                }
-                if rid < len(feedback_to_planner_rounds):
-                    entry["s2p"] = latent_norm_stats(feedback_to_planner_rounds[rid][i])
-                per_round.append(entry)
-            latent_norms_per_sample.append(per_round)
+
         agent1_outputs = []
         for i in range(len(questions)):
             parts = [
@@ -2823,8 +2709,7 @@ def main() -> None:
     ans_retry_max_new_tokens = int(args.ans_max_new_tokens)
     if ans_retry_max_new_tokens <= 0:
         ans_retry_max_new_tokens = 256 if is_code_eval else 16
-    agent3_outputs_pre_retry = list(agent3_outputs)
-    ans_retry_indices: List[int] = []       
+
     if args.ans:
         agent3_outputs, ans_retry_count = run_answer_retry_stage(
             model_name_or_path=solver_model,
@@ -2839,7 +2724,6 @@ def main() -> None:
             top_p=args.top_p,
             max_new_tokens=ans_retry_max_new_tokens,
         )
-        ans_retry_count = len(ans_retry_indices)
         retry_target = "code block" if is_code_eval else "boxed/choice answer"
         print(
             f"[ans] retried {ans_retry_count} samples with missing {retry_target} "
@@ -2935,7 +2819,6 @@ def main() -> None:
             if not args.do_sample:
                 agent3_outputs_by_rollout.append(list(agent3_outputs))
                 continue
-            solver_gen_stats: List[Dict[str, Any]] = []
 
             if args.method == "text":
                 planner_outputs_r, _ = run_text_generation_stage(
@@ -3114,7 +2997,7 @@ def main() -> None:
             else:
                 if solver_rollout_latents is None:
                     raise RuntimeError("Missing solver rollout latents for multi-rollout inference.")
-                rollout_outputs, _ = run_solver_latent_stage(
+                rollout_outputs = run_solver_latent_stage(
                     model_name_or_path=solver_model,
                     questions=questions,
                     refiner_latents=solver_rollout_latents,
@@ -3268,16 +3151,6 @@ def main() -> None:
                             "eval": eval_result,
                             "rollout_idx": 0,
                             "sample_seed": rollout_seeds[0],
-                            "raw_output": agent3_outputs_by_rollout[0][i],
-                            "raw_output_pre_retry": agent3_outputs_pre_retry[i],
-                            "ans_retry_fired": bool(i in ans_retry_indices),
-                            "n_gen_tokens": (solver_gen_stats[i]["n_gen_tokens"]
-                                             if i < len(solver_gen_stats) else None),
-                            "hit_max_tokens": (solver_gen_stats[i]["hit_max_tokens"]
-                                               if i < len(solver_gen_stats) else None),
-                            "latent_norms": (latent_norms_per_sample[i]
-                                             if i < len(latent_norms_per_sample) else None),
-                            "num_recursive_rounds": int(args.num_recursive_rounds),
                         }
                     )
 
@@ -3323,16 +3196,6 @@ def main() -> None:
                             "pred_norm": pred_norm,
                             "rollout_idx": 0,
                             "sample_seed": rollout_seeds[0],
-                            "raw_output": agent3_outputs_by_rollout[0][i],
-                            "raw_output_pre_retry": agent3_outputs_pre_retry[i],
-                            "ans_retry_fired": bool(i in ans_retry_indices),
-                            "n_gen_tokens": (solver_gen_stats[i]["n_gen_tokens"]
-                                             if i < len(solver_gen_stats) else None),
-                            "hit_max_tokens": (solver_gen_stats[i]["hit_max_tokens"]
-                                               if i < len(solver_gen_stats) else None),
-                            "latent_norms": (latent_norms_per_sample[i]
-                                             if i < len(latent_norms_per_sample) else None),
-                            "num_recursive_rounds": int(args.num_recursive_rounds),
                         }
                     )
                 print("=" * 120)
@@ -3409,10 +3272,6 @@ def main() -> None:
                     "gold_answer_raw": gold_answers[i],
                     "pass_at_k_correct": any(rec["correct"] for rec in rollout_records),
                     "rollouts": rollout_records,
-                    "raw_output": agent3_outputs_by_rollout[0][i],
-                    "latent_norms": (latent_norms_per_sample[i]
-                                     if i < len(latent_norms_per_sample) else None),
-                    "num_recursive_rounds": int(args.num_recursive_rounds),
                 }
                 if is_code_eval:
                     row_obj["pred_code_parsed"] = rollout_records[0].get("pred_code_parsed", "")

@@ -101,14 +101,6 @@ _GEN_REPETITION_PENALTY: float = 1.0
 # num_recursive_rounds; temperature is included only where it is dataset-specific (lcb).
 # AIME pass@10 (num_rollouts=10) is handled in run.py. Explicit CLI flags always override
 # these, leaving other datasets unaffected.
-# --- PROBE-PATCH (Anfang): nicht-invasives Auslesen der Latents -------------
-try:
-    from inference_utils import probe_readout as _probe
-except Exception:  # Direktstart ohne Paketkontext
-    import probe_readout as _probe
-# --- PROBE-PATCH (Ende) ----------------------------------------------------
-
-
 RELEASE_RECOMMENDED_SETTINGS: Dict[Tuple[str, str], Dict[str, float]] = {
     # sequential_light
     ("sequential_light", "math500"): {"seed": 42, "batch_size": 16, "latent_length": 32, "num_recursive_rounds": 3},
@@ -1175,12 +1167,6 @@ def run_planner_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="planner->critic", sender="planner", receiver="critic", start=start,
-            hidden=hidden_rollout, inner=planner_self, outer=lat12,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=input_embeds, attention_mask=attention_mask,
-        )
 
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1302,12 +1288,6 @@ def run_refiner_latent_stage(
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="critic->solver", sender="critic", receiver="solver", start=start,
-            hidden=hidden_rollout, inner=refiner_self, outer=mapped,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
 
@@ -1431,12 +1411,6 @@ def run_solver_feedback_latent_stage(
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="solver->planner", sender="solver", receiver="planner", start=start,
-            hidden=hidden_rollout, inner=solver_self, outer=mapped_feedback,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
 
@@ -1557,12 +1531,6 @@ def run_planner_feedback_latent_stage(
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
-        _probe.record_handover(  # PROBE-PATCH
-            stage="planner->critic", sender="planner", receiver="critic", start=start,
-            hidden=hidden_rollout, inner=planner_self, outer=lat12,
-            model=model, tokenizer=tokenizer, embed_layer=embed_layer,
-            prompt_embeds=batch_embeds, attention_mask=attention_mask,
-        )
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
@@ -1994,27 +1962,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save per-sample results as JSONL.",
     )
 
-    # --- PROBE-PATCH (Anfang): Analyse-Auslesen, standardmaessig aus ---------
-    parser.add_argument(
-        "--probe_readout",
-        action="store_true",
-        help="Latents zusaetzlich als Text ins Probe-Log schreiben. Aendert den Lauf nicht.",
-    )
-    parser.add_argument("--probe_jsonl", type=str, default="",
-                        help="Zieldatei des Probe-Logs. Ohne Pfad bleibt der Probe aus.")
-    parser.add_argument("--probe_indices", type=str, default="",
-                        help="Kommaliste von Fragenindizes, z. B. '3,17,88'.")
-    parser.add_argument("--probe_ids_file", type=str, default="",
-                        help="Datei mit je einem Index oder Fragen-Hash pro Zeile.")
-    parser.add_argument("--probe_max_questions", type=int, default=20,
-                        help="Obergrenze der ausgelesenen Fragen (Schutz vor Riesenlogs).")
-    parser.add_argument("--probe_positions", type=str, default="last8",
-                        help="Welche Latent-Positionen: all | lastK | firstK | everyK | 0,-1")
-    parser.add_argument("--probe_topk", type=int, default=5,
-                        help="Wie viele Tokens je Position protokolliert werden.")
-    parser.add_argument("--probe_read_tokens", type=int, default=64,
-                        help="Laenge der Lese-Generierung je Stufe. 0 schaltet sie ab.")
-    # --- PROBE-PATCH (Ende) -------------------------------------------------
     parser.add_argument("--solver_pre_question", type=int, default=0)
     parser.add_argument("--method", type=str, default="ours_recursive",
                         choices=["text", "text_recursive", "ours", "ours_recursive"],
@@ -2128,19 +2075,6 @@ def main() -> None:
             print("[warn] --num_rollouts > 1 but --do_sample is disabled; outputs may be identical.")
 
     base_sample_seed = args.sample_seed if args.sample_seed >= 0 else args.seed
-
-    # --- PROBE-PATCH (Anfang) -----------------------------------------------
-    if getattr(args, "probe_readout", False):
-        _probe.configure(
-            args=args,
-            questions=questions,
-            role_paths={
-                "planner": planner_model,
-                "critic": refiner_model,
-                "solver": solver_model,
-            },
-        )
-    # --- PROBE-PATCH (Ende) -------------------------------------------------
 
     planner_questions = list(questions)
     is_text_method = args.method in {"text", "text_recursive"}
@@ -2608,7 +2542,6 @@ def main() -> None:
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
         for round_idx in range(recursive_rounds):
-            _probe.set_round(round_idx)  # PROBE-PATCH
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(
                     model_name_or_path=planner_model,

@@ -501,8 +501,12 @@ def compare_answers(
 
 
 
-def format_latent_info(latent: torch.Tensor) -> str:
-    steps = int(latent.size(0)) if latent.ndim >= 1 else 0
-    hidden = int(latent.size(1)) if latent.ndim >= 2 else 0
-    dtype = str(latent.dtype).replace("torch.", "")
-    return f"<latent_embedding steps={steps} hidden={hidden} dtype={dtype}>"
+def format_latent_info(x):
+    try:
+        f = x.float()
+        return (f"<latent steps={x.size(0)} hidden={x.size(-1)} "
+                f"norm={f.norm().item():.4f} mean={f.mean().item():+.6f} "
+                f"std={f.std().item():.6f} first3={[round(v,4) for v in f.reshape(-1)[:3].tolist()]}>")
+    except Exception as e:
+        return f"<latent error {e}>"
+

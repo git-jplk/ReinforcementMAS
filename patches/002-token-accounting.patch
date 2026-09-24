@@ -1,0 +1,111 @@
+diff --git a/inference/inference_utils/inference_mas.py b/inference/inference_utils/inference_mas.py
+index 94aad95..ba3904c 100644
+--- a/inference/inference_utils/inference_mas.py
++++ b/inference/inference_utils/inference_mas.py
+@@ -247,6 +247,47 @@ def _load_medqa_records(path: str) -> List[Mapping]:
+     return [x for x in data if isinstance(x, Mapping)]
+ 
+ 
++# --- thesis patch 002: token accounting -----------------------------------
++_TOKEN_STATS = {"prompt": 0, "generated": 0, "calls": 0}
++
++
++def _count_tokens(prompt_len, sequences, pad_token_id=None):
++    """Accumulate prompt/generated token counts. Best effort, never raises."""
++    try:
++        import torch as _torch
++        seqs = sequences.sequences if hasattr(sequences, "sequences") else sequences
++        if not hasattr(seqs, "size"):
++            return
++        rows, total = int(seqs.size(0)), int(seqs.size(1))
++        # generate() returns prompt+continuation for input_ids, and (depending
++        # on the model family) continuation-only for inputs_embeds.
++        if total > prompt_len:
++            gen = seqs[:, prompt_len:]
++            _TOKEN_STATS["prompt"] += rows * int(prompt_len)
++        else:
++            gen = seqs
++            _TOKEN_STATS["prompt"] += rows * int(prompt_len)
++        if pad_token_id is not None:
++            _TOKEN_STATS["generated"] += int((gen != pad_token_id).sum().item())
++        else:
++            _TOKEN_STATS["generated"] += int(gen.numel())
++        _TOKEN_STATS["calls"] += rows
++    except Exception:
++        pass
++
++
++def _report_tokens():
++    if _TOKEN_STATS["calls"]:
++        print(f"[tokens] prompt={_TOKEN_STATS['prompt']} "
++              f"generated={_TOKEN_STATS['generated']} "
++              f"calls={_TOKEN_STATS['calls']}", flush=True)
++
++
++import atexit as _atexit
++_atexit.register(_report_tokens)
++# --- end thesis patch 002 -------------------------------------------------
++
++
+ def load_eval_questions_and_answers(
+     dataset: str,
+     dataset_split: str,
+@@ -1063,6 +1104,8 @@ def run_text_generation_stage(
+ 
+         prompt_len = batch_inputs["input_ids"].size(1)
+         gen_ids = generated[:, prompt_len:]
++        _count_tokens(prompt_len, generated,
++                      getattr(tokenizer, "pad_token_id", None))
+         batch_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+         outputs.extend([text.strip() for text in batch_texts])
+ 
+@@ -1631,6 +1674,8 @@ def run_solver_latent_stage(
+ 
+         sequences = generated.sequences if hasattr(generated, "sequences") else generated
+         prompt_len = attention_mask.size(1)
++        _count_tokens(prompt_len, sequences,
++                      getattr(tokenizer, "pad_token_id", None))
+         # `inputs_embeds` generation return format differs across model families:
+         # some return continuation-only, others return prompt+continuation.
+         # Use max_new_tokens as a robust discriminator to avoid truncating outputs.
+@@ -1932,13 +1977,17 @@ def parse_args() -> argparse.Namespace:
+     )
+ 
+     parser.add_argument("--solver_pre_question", type=int, default=0)
++    parser.add_argument("--method", type=str, default="ours_recursive",
++                        choices=["text", "text_recursive", "ours", "ours_recursive"],
++                        help="Collaboration method. Re-exposed by thesis patch 001.")
+ 
+     return parser.parse_args()
+ 
+ 
+ def main() -> None:
+     args = parse_args()
+-    args.method = "ours_recursive"
++    # thesis patch 001: method now comes from --method
++
+     global _GEN_TOP_K, _GEN_MIN_P, _GEN_REPETITION_PENALTY
+ 
+     if args.mas_shape != "chain":
+diff --git a/inference/run.py b/inference/run.py
+index 9848632..d2d80f9 100755
+--- a/inference/run.py
++++ b/inference/run.py
+@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
+     p.add_argument("--batch_size", type=int, default=8)
+     p.add_argument("--latent_length", type=int, default=32)
+     p.add_argument("--temperature", type=float, default=0.6)
++    p.add_argument("--method", type=str, default="ours_recursive",
++                   choices=["text", "text_recursive", "ours", "ours_recursive"],
++                   help="Collaboration method. Re-exposed by thesis patch 001.")
+     p.add_argument("--top_p", type=float, default=0.95)
+     p.add_argument("--top_k", type=int, default=-1)
+     p.add_argument("--num_rollouts", type=int, default=1, help="Stochastic rollouts for pass@k. AIME defaults to 10 (pass@10) if not set.")
+@@ -265,6 +268,7 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split:
+         out.extend(["--lcb_use_private_tests", str(args.lcb_use_private_tests), "--lcb_timeout_s", "6"])
+     if args.device is not None:
+         out.extend(["--device", str(args.device)])
++    out.extend(["--method", str(args.method)])
+     out.append("--do_sample")
+     out.append("--ans")
+     return out
