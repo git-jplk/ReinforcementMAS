@@ -76,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
              "deliberation {reflector,toolcaller,outer}.",
     )
     
-    p.add_argument("--recursion_aware", default=False, choices =[False, True], type=bool, help="Whether to use recursion awareness in prompts.")
-    p.add_argument("--enable_cache", default=False, choices =[False, True], type=bool, help="Whether to cache intermediate results of models, which the models will use.")
+    p.add_argument("--recursion_aware", action="store_true", help="Whether to use recursion awareness in prompts.")
+    p.add_argument("--enable_cache", action="store_true", help="Whether to cache intermediate results of models, which the models will use.")
     return p
 
 
@@ -331,9 +331,11 @@ def build_cli_for_style(
             "--solver_pre_question", "0",
             "--inner_adapter_type_fallback", "ln_res_adapter",
             "--outer_adapter_type_fallback", "outer_ln_res_adapter",
-            "--recursion_aware", str(args.recursion_aware),
-            "--enable_cache", str(args.enable_cache),
         ] + common
+        if args.recursion_aware:
+            cli.append("--recursion_aware")
+        if args.enable_cache:
+            cli.append("--enable_cache")
         return inference_mas, cli
 
     if family == "mixture":

@@ -10,8 +10,6 @@ import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from embedding_cache import EmbeddingCache
-
 # Work around broken torchvision installs in text-only eval envs.
 _ORIG_FIND_SPEC = importlib.util.find_spec
 
@@ -64,6 +62,7 @@ from prompts import (
     build_math_solver_prompt_with_slots,
 )
 from prompt_resolvers import (
+    CACHE_SLOT,
     prompt_resolve_planner,
     prompt_resolve_refiner,
     prompt_resolve_solver,
@@ -1093,6 +1092,7 @@ def run_planner_latent_stage(
     fn_names: Optional[Sequence[Optional[str]]] = None,
     round_idx: int = 1,
     args: Optional[argparse.Namespace] = None,
+    self_latents_out: Optional[List[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1163,6 +1163,8 @@ def run_planner_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        if self_latents_out is not None:
+            self_latents_out.extend(x.detach().cpu() for x in planner_self)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
 
         for i in range(lat12.size(0)):
@@ -1192,6 +1194,7 @@ def run_refiner_latent_stage(
     round_idx: int = 1,
     args: Optional[argparse.Namespace] = None,
     embedding_cache: list[torch.Tensor] = None,
+    self_latents_out: Optional[List[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
@@ -1247,7 +1250,7 @@ def run_refiner_latent_stage(
             split_prompt_ids_by_slots(
                 tokenizer,
                 user_prompt,
-                [PLANNER_SLOT],
+                [PLANNER_SLOT] + ([CACHE_SLOT] if CACHE_SLOT in user_prompt else []),
                 enable_thinking,
             )
         )
@@ -1261,7 +1264,8 @@ def run_refiner_latent_stage(
     ):
         embed_seqs: List[torch.Tensor] = []
         for idx in range(start, end):
-            seg_prefix, seg_suffix = prompt_segments[idx]
+            segs = prompt_segments[idx]
+            seg_prefix, seg_suffix = segs[0], segs[-1]
             prefix_embeds = token_ids_to_embeds(
                 embed_layer,
                 seg_prefix,
@@ -1275,9 +1279,11 @@ def run_refiner_latent_stage(
                 dtype=refiner_embed_dtype,
             )
             planner_embed = planner_latents[idx].to(device=device, dtype=refiner_embed_dtype)
-            if bool(args.enable_cache):
+            if len(segs) == 3:
+                # CACHE_SLOT present (round > 1): insert this agent's own latents from the previous round.
+                cache_mid_embeds = token_ids_to_embeds(embed_layer, segs[1], device=device, dtype=refiner_embed_dtype)
                 cached_embed = embedding_cache[idx].to(device=device, dtype=refiner_embed_dtype)
-                seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds, cached_embed], dim=0)
+                seq = torch.cat([prefix_embeds, planner_embed, cache_mid_embeds, cached_embed, suffix_embeds], dim=0)
             else:
                 seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
@@ -1291,6 +1297,8 @@ def run_refiner_latent_stage(
             latent_steps=latent_steps,
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
+        if self_latents_out is not None:
+            self_latents_out.extend(x.detach().cpu() for x in refiner_self)
         mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
@@ -1319,6 +1327,7 @@ def run_solver_feedback_latent_stage(
     fn_names: Optional[Sequence[Optional[str]]] = None,
     round_idx: int = 1,
     embedding_cache: list[torch.Tensor] = None,
+    self_latents_out: Optional[List[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
@@ -1378,7 +1387,7 @@ def run_solver_feedback_latent_stage(
             split_prompt_ids_by_slots(
                 tokenizer,
                 user_prompt,
-                [REFINED_SLOT],
+                [REFINED_SLOT] + ([CACHE_SLOT] if CACHE_SLOT in user_prompt else []),
                 enable_thinking,
             )
         )
@@ -1392,7 +1401,8 @@ def run_solver_feedback_latent_stage(
     ):
         embed_seqs: List[torch.Tensor] = []
         for idx in range(start, end):
-            seg_prefix, seg_suffix = prompt_segments[idx]
+            segs = prompt_segments[idx]
+            seg_prefix, seg_suffix = segs[0], segs[-1]
             prefix_embeds = token_ids_to_embeds(
                 embed_layer,
                 seg_prefix,
@@ -1406,9 +1416,11 @@ def run_solver_feedback_latent_stage(
                 dtype=solver_embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=solver_embed_dtype)
-            if bool(args.enable_cache):
+            if len(segs) == 3:
+                # CACHE_SLOT present (round > 1): insert this agent's own latents from the previous round.
+                cache_mid_embeds = token_ids_to_embeds(embed_layer, segs[1], device=device, dtype=solver_embed_dtype)
                 cached_embed = embedding_cache[idx].to(device=device, dtype=solver_embed_dtype)
-                seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds, cached_embed], dim=0)
+                seq = torch.cat([prefix_embeds, refiner_embed, cache_mid_embeds, cached_embed, suffix_embeds], dim=0)
             else:
                 seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
@@ -1422,6 +1434,8 @@ def run_solver_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
+        if self_latents_out is not None:
+            self_latents_out.extend(x.detach().cpu() for x in solver_self)
         mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
@@ -1450,6 +1464,7 @@ def run_planner_feedback_latent_stage(
     round_idx: int = 1,
     args: Optional[argparse.Namespace] = None,
     embedding_cache: list[torch.Tensor] = None,
+    self_latents_out: Optional[List[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1507,7 +1522,7 @@ def run_planner_feedback_latent_stage(
             split_prompt_ids_by_slots(
                 tokenizer,
                 user_prompt,
-                [FEEDBACK_SLOT],
+                [FEEDBACK_SLOT] + ([CACHE_SLOT] if CACHE_SLOT in user_prompt else []),
                 enable_thinking,
             )
         )
@@ -1521,7 +1536,8 @@ def run_planner_feedback_latent_stage(
     ):
         embed_seqs: List[torch.Tensor] = []
         for idx in range(start, end):
-            seg_prefix, seg_suffix = prompt_segments[idx]
+            segs = prompt_segments[idx]
+            seg_prefix, seg_suffix = segs[0], segs[-1]
             prefix_embeds = token_ids_to_embeds(
                 embed_layer,
                 seg_prefix,
@@ -1535,9 +1551,11 @@ def run_planner_feedback_latent_stage(
                 dtype=planner_embed_dtype,
             )
             feedback_embed = feedback_latents[idx].to(device=device, dtype=planner_embed_dtype)
-            if bool(args.enable_cache):
+            if len(segs) == 3:
+                # CACHE_SLOT present (round > 1): insert this agent's own latents from the previous round.
+                cache_mid_embeds = token_ids_to_embeds(embed_layer, segs[1], device=device, dtype=planner_embed_dtype)
                 cached_embed = embedding_cache[idx].to(device=device, dtype=planner_embed_dtype)
-                seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds, cached_embed], dim=0)
+                seq = torch.cat([prefix_embeds, feedback_embed, cache_mid_embeds, cached_embed, suffix_embeds], dim=0)
             else:
                 seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
@@ -1551,6 +1569,8 @@ def run_planner_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        if self_latents_out is not None:
+            self_latents_out.extend(x.detach().cpu() for x in planner_self)
         lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1614,7 +1634,7 @@ def run_solver_latent_stage(
             split_prompt_ids_by_slots(
                 tokenizer,
                 user_prompt,
-                [REFINED_SLOT],
+                [REFINED_SLOT] + ([CACHE_SLOT] if CACHE_SLOT in user_prompt else []),
                 enable_thinking,
             )
         )
@@ -1636,7 +1656,8 @@ def run_solver_latent_stage(
     ):
         embed_seqs: List[torch.Tensor] = []
         for idx in range(start, end):
-            seg_prefix, seg_suffix = prompt_segments[idx]
+            segs = prompt_segments[idx]
+            seg_prefix, seg_suffix = segs[0], segs[-1]
             prefix_embeds = token_ids_to_embeds(
                 embed_layer,
                 seg_prefix,
@@ -1650,14 +1671,17 @@ def run_solver_latent_stage(
                 dtype=embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=embed_dtype)
-            if bool(args.enable_cache):
+            if len(segs) == 3:
+                # CACHE_SLOT present (round > 1): insert this agent's own latents from the previous round.
+                cache_mid_embeds = token_ids_to_embeds(embed_layer, segs[1], device=device, dtype=embed_dtype)
                 cached_embed = embedding_cache[idx].to(device=device, dtype=embed_dtype)
                 seq = torch.cat(
                     [
                         prefix_embeds,
                         refiner_embed,
-                        suffix_embeds,
+                        cache_mid_embeds,
                         cached_embed,
+                        suffix_embeds,
                     ],
                     dim=0,
                 )
@@ -1815,8 +1839,8 @@ def render_inputs_for_logging(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--recursion_aware", type=bool, default=False)
-    parser.add_argument("--enable_cache", type=bool, default=False)
+    parser.add_argument("--recursion_aware", action="store_true")
+    parser.add_argument("--enable_cache", action="store_true")
     parser.add_argument("--mas_shape", type=str, default="chain", choices=["chain"])
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
     parser.add_argument("--dataset_split", type=str, default="test")
@@ -2268,6 +2292,7 @@ def main() -> None:
         rollout_seeds.append(base_sample_seed)
 
     solver_rollout_latents: Optional[List[torch.Tensor]] = None
+    solver_cache: List[torch.Tensor] = []
     text_recursive_solver_outputs_rounds_for_log: Optional[List[List[str]]] = None
 
     if args.method == "text":
@@ -2578,7 +2603,7 @@ def main() -> None:
         planner_to_refiner_rounds: List[List[torch.Tensor]] = []
         refiner_to_solver_rounds: List[List[torch.Tensor]] = []
         feedback_to_planner_rounds: List[List[torch.Tensor]] = []
-        use_cache: bool = bool(args.use_embedding_cache)
+        use_cache: bool = bool(args.enable_cache)
         refiner_cache:List[torch.Tensor] = []
         planner_cache:List[torch.Tensor] = []
         solver_cache:List[torch.Tensor] = []
@@ -2586,6 +2611,10 @@ def main() -> None:
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
         for round_idx in range(recursive_rounds):
+            # Each agent's own latents from this round, used as its cache in the next round.
+            new_planner_cache: List[torch.Tensor] = []
+            new_refiner_cache: List[torch.Tensor] = []
+            new_solver_cache: List[torch.Tensor] = []
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(
                     model_name_or_path=planner_model,
@@ -2605,6 +2634,7 @@ def main() -> None:
                     fn_names=fn_names,
                     round_idx=round_idx + 1,
                     args=args,
+                    self_latents_out=new_planner_cache if use_cache else None,
                 )
             else:
                 if feedback_to_planner is None:
@@ -2626,12 +2656,13 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                     round_idx=round_idx + 1,
                     args=args,
-                    embedding_cache=planner_cache
+                    embedding_cache=planner_cache,
+                    self_latents_out=new_planner_cache if use_cache else None,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
             if use_cache:
-                planner_cache = planner_to_refiner
+                planner_cache = new_planner_cache
 
             refiner_to_solver = run_refiner_latent_stage(
                 model_name_or_path=refiner_model,
@@ -2652,12 +2683,13 @@ def main() -> None:
                 fn_names=fn_names,
                 round_idx=round_idx + 1,
                 args=args,
-                embedding_cache=refiner_cache
+                embedding_cache=refiner_cache,
+                self_latents_out=new_refiner_cache if use_cache else None,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
             if use_cache:
-                refiner_cache = refiner_to_solver
+                refiner_cache = new_refiner_cache
 
             if round_idx < recursive_rounds - 1:
                 feedback_to_planner = run_solver_feedback_latent_stage(
@@ -2679,12 +2711,13 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     round_idx=round_idx + 1,
-                    embedding_cache=solver_cache
+                    embedding_cache=solver_cache,
+                    self_latents_out=new_solver_cache if use_cache else None,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)
                 if use_cache:
-                    solver_cache = feedback_to_planner
+                    solver_cache = new_solver_cache
 
         final_refiner_to_solver = refiner_to_solver_rounds[-1]
         solver_outputs = run_solver_latent_stage(
@@ -3124,6 +3157,7 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     round_idx=final_round_idx,
+                    embedding_cache=solver_cache,
                 )
 
             if args.ans:
