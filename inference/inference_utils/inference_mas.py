@@ -1,5 +1,3 @@
-# inference_mas.py
-
 import argparse
 from collections.abc import Mapping
 import gc
@@ -11,6 +9,8 @@ import random
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from embedding_cache import EmbeddingCache
 
 # Work around broken torchvision installs in text-only eval envs.
 _ORIG_FIND_SPEC = importlib.util.find_spec
@@ -62,6 +62,11 @@ from prompts import (
     build_math_refiner_prompt_with_slot,
     build_math_solver_prompt,
     build_math_solver_prompt_with_slots,
+)
+from prompt_resolvers import (
+    prompt_resolve_planner,
+    prompt_resolve_refiner,
+    prompt_resolve_solver,
 )
 from .lcb_utils import (
     build_code_reparse_suffix,
@@ -1086,6 +1091,8 @@ def run_planner_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    round_idx: int = 1,
+    args: Optional[argparse.Namespace] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1124,9 +1131,13 @@ def run_planner_latent_stage(
     for idx, question in enumerate(questions):
         if task_types is not None:
             fn_name = fn_names[idx] if fn_names is not None else None
-            user_prompt = build_code_planner_prompt(question, task_types[idx], fn_name=fn_name)
+            user_prompt = prompt_resolve_planner(
+                build_code_planner_prompt(question, task_types[idx], fn_name=fn_name),
+                args,
+                round_idx,
+            )
         else:
-            user_prompt = build_math_planner_prompt(question)
+            user_prompt = prompt_resolve_planner(build_math_planner_prompt(question), args, round_idx)
         prompt_ids.append(render_chat_prompt_ids(tokenizer, user_prompt, enable_thinking))
 
     planner_to_refiner: List[torch.Tensor] = []
@@ -1178,6 +1189,9 @@ def run_refiner_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    round_idx: int = 1,
+    args: Optional[argparse.Namespace] = None,
+    embedding_cache: list[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
@@ -1222,13 +1236,13 @@ def run_refiner_latent_stage(
     for idx, question in enumerate(questions):
         if task_types is not None:
             fn_name = fn_names[idx] if fn_names is not None else None
-            user_prompt = build_code_refiner_prompt_with_slot(
+            user_prompt = prompt_resolve_refiner(build_code_refiner_prompt_with_slot(
                 question,
                 task_types[idx],
                 fn_name=fn_name,
-            )
+            ), args, round_idx)
         else:
-            user_prompt = build_math_refiner_prompt_with_slot(question)
+            user_prompt = prompt_resolve_refiner(build_math_refiner_prompt_with_slot(question), args, round_idx)
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1261,7 +1275,11 @@ def run_refiner_latent_stage(
                 dtype=refiner_embed_dtype,
             )
             planner_embed = planner_latents[idx].to(device=device, dtype=refiner_embed_dtype)
-            seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds], dim=0)
+            if bool(args.enable_cache):
+                cached_embed = embedding_cache[idx].to(device=device, dtype=refiner_embed_dtype)
+                seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds, cached_embed], dim=0)
+            else:
+                seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1299,6 +1317,8 @@ def run_solver_feedback_latent_stage(
     args: argparse.Namespace,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    round_idx: int = 1,
+    embedding_cache: list[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
@@ -1343,15 +1363,17 @@ def run_solver_feedback_latent_stage(
     for idx, question in enumerate(questions):
         if task_types is not None:
             fn_name = fn_names[idx] if fn_names is not None else None
-            user_prompt = build_code_solver_prompt_with_slots(
+            user_prompt = prompt_resolve_solver(build_code_solver_prompt_with_slots(
                 question,
                 task_types[idx],
                 args=args,
                 mas_shape=args.mas_shape,
                 fn_name=fn_name,
-            )
+            ), args, round_idx)
         else:
-            user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+            user_prompt = prompt_resolve_solver(
+                build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape), args, round_idx
+            )
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1384,7 +1406,11 @@ def run_solver_feedback_latent_stage(
                 dtype=solver_embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=solver_embed_dtype)
-            seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds], dim=0)
+            if bool(args.enable_cache):
+                cached_embed = embedding_cache[idx].to(device=device, dtype=solver_embed_dtype)
+                seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds, cached_embed], dim=0)
+            else:
+                seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1421,6 +1447,9 @@ def run_planner_feedback_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    round_idx: int = 1,
+    args: Optional[argparse.Namespace] = None,
+    embedding_cache: list[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
@@ -1465,13 +1494,15 @@ def run_planner_feedback_latent_stage(
     for idx, question in enumerate(questions):
         if task_types is not None:
             fn_name = fn_names[idx] if fn_names is not None else None
-            user_prompt = build_code_planner_prompt_with_feedback_slot(
+            user_prompt = prompt_resolve_planner(build_code_planner_prompt_with_feedback_slot(
                 question,
                 task_types[idx],
                 fn_name=fn_name,
-            )
+            ), args, round_idx)
         else:
-            user_prompt = build_math_planner_prompt_with_feedback_slot(question)
+            user_prompt = prompt_resolve_planner(
+                build_math_planner_prompt_with_feedback_slot(question), args, round_idx
+            )
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1504,7 +1535,11 @@ def run_planner_feedback_latent_stage(
                 dtype=planner_embed_dtype,
             )
             feedback_embed = feedback_latents[idx].to(device=device, dtype=planner_embed_dtype)
-            seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds], dim=0)
+            if bool(args.enable_cache):
+                cached_embed = embedding_cache[idx].to(device=device, dtype=planner_embed_dtype)
+                seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds, cached_embed], dim=0)
+            else:
+                seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds], dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1540,6 +1575,8 @@ def run_solver_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    round_idx: int = 1,
+    embedding_cache: list[torch.Tensor] = None,
 ) -> List[str]:
     model, tokenizer = load_agent_model_and_tokenizer(
         model_name_or_path=model_name_or_path,
@@ -1562,15 +1599,17 @@ def run_solver_latent_stage(
     for idx, question in enumerate(questions):
         if task_types is not None:
             fn_name = fn_names[idx] if fn_names is not None else None
-            user_prompt = build_code_solver_prompt_with_slots(
+            user_prompt = prompt_resolve_solver(build_code_solver_prompt_with_slots(
                 question,
                 task_types[idx],
                 args=args,
                 mas_shape=args.mas_shape,
                 fn_name=fn_name,
-            )
+            ), args, round_idx)
         else:
-            user_prompt = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+            user_prompt = prompt_resolve_solver(
+                build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape), args, round_idx
+            )
         prompt_segments.append(
             split_prompt_ids_by_slots(
                 tokenizer,
@@ -1611,14 +1650,26 @@ def run_solver_latent_stage(
                 dtype=embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=embed_dtype)
-            seq = torch.cat(
-                [
-                    prefix_embeds,
-                    refiner_embed,
-                    suffix_embeds,
-                ],
-                dim=0,
-            )
+            if bool(args.enable_cache):
+                cached_embed = embedding_cache[idx].to(device=device, dtype=embed_dtype)
+                seq = torch.cat(
+                    [
+                        prefix_embeds,
+                        refiner_embed,
+                        suffix_embeds,
+                        cached_embed,
+                    ],
+                    dim=0,
+                )
+            else:
+                seq = torch.cat(
+                    [
+                        prefix_embeds,
+                        refiner_embed,
+                        suffix_embeds,
+                    ],
+                    dim=0,
+                )
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1764,6 +1815,8 @@ def render_inputs_for_logging(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--recursion_aware", type=bool, default=False)
+    parser.add_argument("--enable_cache", type=bool, default=False)
     parser.add_argument("--mas_shape", type=str, default="chain", choices=["chain"])
     parser.add_argument("--dataset", type=str, default="openai/gsm8k")
     parser.add_argument("--dataset_split", type=str, default="test")
@@ -2041,6 +2094,9 @@ def main() -> None:
 
     base_sample_seed = args.sample_seed if args.sample_seed >= 0 else args.seed
 
+    # 1-based index of the last round; prompts for the final hand-off to the solver use it.
+    final_round_idx = int(args.num_recursive_rounds) if args.method in {"ours_recursive", "text_recursive"} else 1
+
     planner_questions = list(questions)
     is_text_method = args.method in {"text", "text_recursive"}
     planner_soften_step_template = is_text_method and (not is_code_eval) and is_gemma_model_name(planner_model)
@@ -2129,56 +2185,67 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(rollout_seed)
         return rollout_seed
-    def build_planner_prompt_text(question: str, sample_idx: int, feedback_text: Optional[str] = None) -> str:
+    def build_planner_prompt_text(
+        question: str,
+        sample_idx: int,
+        feedback_text: Optional[str] = None,
+        round_idx: int = 1,
+    ) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code planner prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
             if feedback_text is None:
-                return build_code_planner_prompt(question, task_types[sample_idx], fn_name=fn_name)
-            return build_code_planner_prompt_with_feedback_slot(
+                return prompt_resolve_planner(
+                    build_code_planner_prompt(question, task_types[sample_idx], fn_name=fn_name),
+                    args,
+                    round_idx,
+                )
+            return prompt_resolve_planner(build_code_planner_prompt_with_feedback_slot(
                 question,
                 task_types[sample_idx],
                 fn_name=fn_name,
-            ).replace(FEEDBACK_SLOT, feedback_text)
+            ), args, round_idx).replace(FEEDBACK_SLOT, feedback_text)
 
         if feedback_text is None:
-            prompt = build_math_planner_prompt(question)
+            prompt = prompt_resolve_planner(build_math_planner_prompt(question), args, round_idx)
         else:
-            prompt = build_math_planner_prompt_with_feedback_slot(question).replace(FEEDBACK_SLOT, feedback_text)
+            prompt = prompt_resolve_planner(
+                build_math_planner_prompt_with_feedback_slot(question), args, round_idx
+            ).replace(FEEDBACK_SLOT, feedback_text)
         if planner_soften_step_template:
             prompt = soften_planner_format_instruction(prompt)
         return prompt
 
-    def build_refiner_prompt_text(question: str, planner_output: str, sample_idx: int) -> str:
+    def build_refiner_prompt_text(question: str, planner_output: str, sample_idx: int, round_idx: int = 1) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code refiner prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
-            return build_code_refiner_prompt(
+            return prompt_resolve_refiner(build_code_refiner_prompt(
                 question,
                 planner_output,
                 task_types[sample_idx],
                 fn_name=fn_name,
-            )
-        prompt = build_math_refiner_prompt(question, planner_output)
+            ), args, round_idx)
+        prompt = prompt_resolve_refiner(build_math_refiner_prompt(question, planner_output), args, round_idx)
         if refiner_force_plan_only:
             prompt = f"{prompt}\nDo not calculate the final answer."
         return prompt
 
-    def build_solver_prompt_text(question: str, refined_plan: str, sample_idx: int) -> str:
+    def build_solver_prompt_text(question: str, refined_plan: str, sample_idx: int, round_idx: int = 1) -> str:
         if is_code_eval:
             if task_types is None:
                 raise RuntimeError("Missing task_types for code solver prompt.")
             fn_name = fn_names[sample_idx] if fn_names is not None else None
-            return build_code_solver_prompt(
+            return prompt_resolve_solver(build_code_solver_prompt(
                 question,
                 refined_plan,
                 task_types[sample_idx],
                 args=args,
                 fn_name=fn_name,
-            )
-        return build_math_solver_prompt(question, refined_plan, args)
+            ), args, round_idx)
+        return prompt_resolve_solver(build_math_solver_prompt(question, refined_plan, args), args, round_idx)
 
     agent1_inputs: List[str] = [
         build_planner_prompt_text(planner_questions[i], i)
@@ -2290,7 +2357,7 @@ def main() -> None:
                 if solver_feedback is None:
                     raise RuntimeError("Missing solver feedback for text-recursive round > 1.")
                 planner_prompts_r = [
-                    build_planner_prompt_text(planner_questions[i], i, solver_feedback[i])
+                    build_planner_prompt_text(planner_questions[i], i, solver_feedback[i], round_idx=rid)
                     for i in range(len(planner_questions))
                 ]
 
@@ -2311,7 +2378,7 @@ def main() -> None:
             planner_outputs_r = postprocess_planner_outputs(planner_outputs_r, f"planner-r{rid}")
 
             refiner_prompts_r = [
-                build_refiner_prompt_text(questions[i], planner_outputs_r[i], i)
+                build_refiner_prompt_text(questions[i], planner_outputs_r[i], i, round_idx=rid)
                 for i in range(len(questions))
             ]
             refiner_outputs_r, refiner_inputs_r_rendered = run_text_generation_stage(
@@ -2331,7 +2398,7 @@ def main() -> None:
             refiner_outputs_r = postprocess_refiner_outputs(refiner_outputs_r, f"refiner-r{rid}")
 
             solver_prompts_r = [
-                build_solver_prompt_text(questions[i], refiner_outputs_r[i], i)
+                build_solver_prompt_text(questions[i], refiner_outputs_r[i], i, round_idx=rid)
                 for i in range(len(questions))
             ]
             solver_outputs_r, solver_inputs_r_rendered = run_text_generation_stage(
@@ -2417,6 +2484,8 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            round_idx=1,
+            args=args,
         )
         refiner_to_solver = run_refiner_latent_stage(
             model_name_or_path=refiner_model,
@@ -2435,6 +2504,8 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            round_idx=1,
+            args=args,
         )
         solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
@@ -2452,6 +2523,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            round_idx=1,
         )
         planner_to_refiner_desc = [format_latent_info(x) for x in planner_to_refiner]
         refiner_to_solver_desc = [format_latent_info(x) for x in refiner_to_solver]
@@ -2467,13 +2539,13 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code refiner slot prompt.")
                 fn_name = fn_names[i] if fn_names is not None else None
-                a2_in = build_code_refiner_prompt_with_slot(
+                a2_in = prompt_resolve_refiner(build_code_refiner_prompt_with_slot(
                     question,
                     task_types[i],
                     fn_name=fn_name,
-                ).replace(PLANNER_SLOT, planner_to_refiner_desc[i])
+                ), args, 1).replace(PLANNER_SLOT, planner_to_refiner_desc[i])
             else:
-                a2_in = build_math_refiner_prompt_with_slot(question).replace(
+                a2_in = prompt_resolve_refiner(build_math_refiner_prompt_with_slot(question), args, 1).replace(
                     PLANNER_SLOT, planner_to_refiner_desc[i]
                 )
             agent2_inputs.append(a2_in)
@@ -2487,15 +2559,17 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code solver slot prompt.")
                 fn_name = fn_names[i] if fn_names is not None else None
-                a3_in = build_code_solver_prompt_with_slots(
+                a3_in = prompt_resolve_solver(build_code_solver_prompt_with_slots(
                     question,
                     task_types[i],
                     args=args,
                     mas_shape=args.mas_shape,
                     fn_name=fn_name,
-                )
+                ), args, 1)
             else:
-                a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+                a3_in = prompt_resolve_solver(
+                    build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape), args, 1
+                )
             a3_in = a3_in.replace(REFINED_SLOT, refiner_to_solver_desc[i])
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
@@ -2504,6 +2578,11 @@ def main() -> None:
         planner_to_refiner_rounds: List[List[torch.Tensor]] = []
         refiner_to_solver_rounds: List[List[torch.Tensor]] = []
         feedback_to_planner_rounds: List[List[torch.Tensor]] = []
+        use_cache: bool = bool(args.use_embedding_cache)
+        refiner_cache:List[torch.Tensor] = []
+        planner_cache:List[torch.Tensor] = []
+        solver_cache:List[torch.Tensor] = []
+
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
         for round_idx in range(recursive_rounds):
@@ -2524,6 +2603,8 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                     task_types=task_types,
                     fn_names=fn_names,
+                    round_idx=round_idx + 1,
+                    args=args,
                 )
             else:
                 if feedback_to_planner is None:
@@ -2543,9 +2624,14 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    round_idx=round_idx + 1,
+                    args=args,
+                    embedding_cache=planner_cache
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
+            if use_cache:
+                planner_cache = planner_to_refiner
 
             refiner_to_solver = run_refiner_latent_stage(
                 model_name_or_path=refiner_model,
@@ -2564,9 +2650,14 @@ def main() -> None:
                 enable_thinking=enable_thinking,
                 task_types=task_types,
                 fn_names=fn_names,
+                round_idx=round_idx + 1,
+                args=args,
+                embedding_cache=refiner_cache
             )
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
+            if use_cache:
+                refiner_cache = refiner_to_solver
 
             if round_idx < recursive_rounds - 1:
                 feedback_to_planner = run_solver_feedback_latent_stage(
@@ -2587,9 +2678,13 @@ def main() -> None:
                     args=args,
                     task_types=task_types,
                     fn_names=fn_names,
+                    round_idx=round_idx + 1,
+                    embedding_cache=solver_cache
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)
+                if use_cache:
+                    solver_cache = feedback_to_planner
 
         final_refiner_to_solver = refiner_to_solver_rounds[-1]
         solver_outputs = run_solver_latent_stage(
@@ -2608,6 +2703,8 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            round_idx=recursive_rounds,
+            embedding_cache=solver_cache
         )
 
         planner_to_refiner_desc_rounds = [
@@ -2636,13 +2733,15 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code refiner slot prompt.")
                 fn_name = fn_names[i] if fn_names is not None else None
-                a2_in = build_code_refiner_prompt_with_slot(
+                a2_in = prompt_resolve_refiner(build_code_refiner_prompt_with_slot(
                     question,
                     task_types[i],
                     fn_name=fn_name,
-                ).replace(PLANNER_SLOT, final_planner_desc[i])
+                ), args, recursive_rounds).replace(PLANNER_SLOT, final_planner_desc[i])
             else:
-                a2_in = build_math_refiner_prompt_with_slot(question).replace(PLANNER_SLOT, final_planner_desc[i])
+                a2_in = prompt_resolve_refiner(
+                    build_math_refiner_prompt_with_slot(question), args, recursive_rounds
+                ).replace(PLANNER_SLOT, final_planner_desc[i])
             agent2_inputs.append(a2_in)
 
         agent2_outputs = []
@@ -2660,15 +2759,17 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code solver slot prompt.")
                 fn_name = fn_names[i] if fn_names is not None else None
-                a3_in = build_code_solver_prompt_with_slots(
+                a3_in = prompt_resolve_solver(build_code_solver_prompt_with_slots(
                     question,
                     task_types[i],
                     args=args,
                     mas_shape=args.mas_shape,
                     fn_name=fn_name,
-                )
+                ), args, recursive_rounds)
             else:
-                a3_in = build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+                a3_in = prompt_resolve_solver(
+                    build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape), args, recursive_rounds
+                )
             a3_in = a3_in.replace(REFINED_SLOT, final_refiner_desc[i])
             agent3_inputs.append(a3_in)
         agent3_outputs = solver_outputs
@@ -2678,10 +2779,6 @@ def main() -> None:
             build_planner_prompt_text(planner_questions[i], i)
             for i in range(len(questions))
         ]
-        a1_roundk_prompts = [
-            build_planner_prompt_text(planner_questions[i], i, FEEDBACK_SLOT)
-            for i in range(len(questions))
-        ]
         a1_round1_rendered = render_inputs_for_logging(
             model_name_or_path=planner_model,
             user_prompts=a1_round1_prompts,
@@ -2689,20 +2786,28 @@ def main() -> None:
             agent_name="agent1-r1",
             enable_thinking=enable_thinking,
         )
-        a1_roundk_rendered = render_inputs_for_logging(
-            model_name_or_path=planner_model,
-            user_prompts=a1_roundk_prompts,
-            trust_remote_code=trust_remote_code,
-            agent_name="agent1-rk",
-            enable_thinking=enable_thinking,
-        )
+        # Rounds >= 2 use the feedback-slot planner prompt. Render it once per round, since the
+        # prompt resolver may return a different prompt for each round.
+        a1_roundk_rendered: Dict[int, List[str]] = {}
+        for rid in range(2, recursive_rounds + 1):
+            a1_roundk_prompts = [
+                build_planner_prompt_text(planner_questions[i], i, FEEDBACK_SLOT, round_idx=rid)
+                for i in range(len(questions))
+            ]
+            a1_roundk_rendered[rid] = render_inputs_for_logging(
+                model_name_or_path=planner_model,
+                user_prompts=a1_roundk_prompts,
+                trust_remote_code=trust_remote_code,
+                agent_name=f"agent1-r{rid}",
+                enable_thinking=enable_thinking,
+            )
         agent1_inputs_for_log = []
         for i in range(len(questions)):
             parts = [f"[Round1 planner input]\n{a1_round1_rendered[i]}"]
             for rid in range(1, recursive_rounds):
                 fb_desc = feedback_to_planner_desc_rounds[rid - 1][i]
                 parts.append(f"[Round{rid} feedback latent] {fb_desc}")
-                parts.append(f"[Round{rid + 1} planner input]\n{a1_roundk_rendered[i]}")
+                parts.append(f"[Round{rid + 1} planner input]\n{a1_roundk_rendered[rid + 1][i]}")
             agent1_inputs_for_log.append("\n\n".join(parts))
 
     ans_retry_count = 0
@@ -2744,16 +2849,17 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code refiner slot logging prompts.")
                 agent2_slot_prompts = [
-                    build_code_refiner_prompt_with_slot(
+                    prompt_resolve_refiner(build_code_refiner_prompt_with_slot(
                         questions[i],
                         task_types[i],
                         fn_name=(fn_names[i] if fn_names is not None else None),
-                    )
+                    ), args, final_round_idx)
                     for i in range(len(questions))
                 ]
             else:
                 agent2_slot_prompts = [
-                    build_math_refiner_prompt_with_slot(question) for question in questions
+                    prompt_resolve_refiner(build_math_refiner_prompt_with_slot(question), args, final_round_idx)
+                    for question in questions
                 ]
             agent2_inputs_for_log = render_inputs_for_logging(
                 model_name_or_path=refiner_model,
@@ -2776,18 +2882,22 @@ def main() -> None:
                 if task_types is None:
                     raise RuntimeError("Missing task_types for code solver slot logging prompts.")
                 agent3_slot_prompts = [
-                    build_code_solver_prompt_with_slots(
+                    prompt_resolve_solver(build_code_solver_prompt_with_slots(
                         questions[i],
                         task_types[i],
                         args=args,
                         mas_shape=args.mas_shape,
                         fn_name=(fn_names[i] if fn_names is not None else None),
-                    )
+                    ), args, final_round_idx)
                     for i in range(len(questions))
                 ]
             else:
                 agent3_slot_prompts = [
-                    build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape)
+                    prompt_resolve_solver(
+                        build_math_solver_prompt_with_slots(question, args, mas_shape=args.mas_shape),
+                        args,
+                        final_round_idx,
+                    )
                     for question in questions
                 ]
             agent3_inputs_for_log = render_inputs_for_logging(
@@ -2935,7 +3045,7 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                 )
                 planner_prompts_r2 = [
-                    build_planner_prompt_text(planner_questions[i], i, solver_outputs_r1[i])
+                    build_planner_prompt_text(planner_questions[i], i, solver_outputs_r1[i], round_idx=2)
                     for i in range(len(planner_questions))
                 ]
                 planner_outputs_r2, _ = run_text_generation_stage(
@@ -2956,7 +3066,7 @@ def main() -> None:
                     planner_outputs_r2, f"planner-r2-k{rollout_idx + 1}"
                 )
                 refiner_prompts_r2 = [
-                    build_refiner_prompt_text(questions[i], planner_outputs_r2[i], i)
+                    build_refiner_prompt_text(questions[i], planner_outputs_r2[i], i, round_idx=2)
                     for i in range(len(questions))
                 ]
                 refiner_outputs_r2, _ = run_text_generation_stage(
@@ -2977,7 +3087,7 @@ def main() -> None:
                     refiner_outputs_r2, f"refiner-r2-k{rollout_idx + 1}"
                 )
                 solver_prompts_r2 = [
-                    build_solver_prompt_text(questions[i], refiner_outputs_r2[i], i)
+                    build_solver_prompt_text(questions[i], refiner_outputs_r2[i], i, round_idx=2)
                     for i in range(len(questions))
                 ]
                 rollout_outputs = run_text_generation_stage(
@@ -3013,6 +3123,7 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                     task_types=task_types,
                     fn_names=fn_names,
+                    round_idx=final_round_idx,
                 )
 
             if args.ans:
